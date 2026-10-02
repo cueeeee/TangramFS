@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200112L
 #define NI_MAXHOST      1025
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -269,6 +270,17 @@ void uct_ep_create_connect(uct_iface_h iface, tangram_uct_addr_t* addr, uct_ep_h
     tangram_assert(status == UCS_OK);
 }
 
+ucs_status_t uct_ep_create_connect_try(uct_iface_h iface, tangram_uct_addr_t* addr, uct_ep_h* ep) {
+    uct_ep_params_t ep_params;
+    ep_params.field_mask = UCT_EP_PARAM_FIELD_IFACE     |
+                           UCT_EP_PARAM_FIELD_DEV_ADDR  |
+                           UCT_EP_PARAM_FIELD_IFACE_ADDR;
+    ep_params.iface      = iface;
+    ep_params.dev_addr   = addr->dev;
+    ep_params.iface_addr = addr->iface;
+    return uct_ep_create(&ep_params, ep);
+}
+
 void* pack_rpc_buffer(tangram_uct_addr_t* addr, void* data, size_t inlen, size_t* outlen) {
 
     *outlen = 2 * sizeof(size_t) + addr->dev_len + addr->iface_len + inlen;
@@ -347,6 +359,34 @@ void do_uct_am_short_lock(pthread_mutex_t *lock, uct_ep_h ep, uint8_t id, uint64
 
     free(buf);
     tangram_assert(status == UCS_OK);
+}
+
+ucs_status_t do_uct_am_short_lock_try(pthread_mutex_t *lock, uct_ep_h ep, uint8_t id, uint64_t seq_id, tangram_uct_addr_t* my_addr, void* data, size_t data_len, int timeout_ms) {
+    size_t buf_len;
+    void* buf = pack_rpc_buffer(my_addr, data, data_len, &buf_len);
+
+    struct timespec start, now;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    ucs_status_t status;
+    while(true) {
+        pthread_mutex_lock(lock);
+        status = uct_ep_am_short(ep, id, seq_id, buf, buf_len);
+        pthread_mutex_unlock(lock);
+        if(status != UCS_ERR_NO_RESOURCE)
+            break;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if(elapsed_ms >= timeout_ms) {
+            status = UCS_ERR_TIMED_OUT;
+            break;
+        }
+        usleep(50);     // let the progress thread take the lock and make progress
+    }
+
+    free(buf);
+    return status;
 }
 
 void do_uct_am_short_progress(uct_worker_h worker, uct_ep_h ep, uint8_t id, uint64_t seq_id, tangram_uct_addr_t* my_addr, void* data, size_t data_len) {

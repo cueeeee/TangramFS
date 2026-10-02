@@ -127,6 +127,8 @@ void tangram_rpc_service_start(tfs_info_t *tfs_info){
 
 void tangram_rpc_service_stop() {
     if(g_tfs_info->use_delegator && g_tfs_info->mpi_intra_rank == 0) {
+        // BUGFIX (Bug 4): hand our locks back to the server BEFORE stopping.
+        tangram_delegator_flush_to_server();
         tangram_ucx_stop_delegator();
         tangram_delegator_stop();
     }

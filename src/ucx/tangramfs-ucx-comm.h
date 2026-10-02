@@ -79,10 +79,21 @@ void exchange_dev_iface_addr(tangram_uct_context_t* context, tangram_uct_addr_t*
 
 void uct_ep_create_connect(uct_iface_h iface, tangram_uct_addr_t* dest, uct_ep_h* ep);
 
+// Non-asserting variants, for talking to a peer that may legitimately be gone
+// (e.g. another node's delegator that is shutting down or already exited).
+// Return the UCX status instead of aborting the whole process on failure.
+ucs_status_t uct_ep_create_connect_try(uct_iface_h iface, tangram_uct_addr_t* dest, uct_ep_h* ep);
+
 
 void unpack_rpc_buffer(void* buf, size_t buf_len, uint64_t* seq_id, tangram_uct_addr_t* sender, void** data_ptr);
 
 void do_uct_am_short_lock(pthread_mutex_t *lock, uct_ep_h ep, uint8_t id, uint64_t seq_id, tangram_uct_addr_t* my_addr, void* data, size_t length);
+// Like do_uct_am_short_lock(), but (a) returns the status instead of asserting,
+// and (b) gives up with UCS_ERR_TIMED_OUT if the send keeps failing with
+// UCS_ERR_NO_RESOURCE for longer than timeout_ms. Without (b), sending to a peer
+// whose process has stopped driving its UCX progress engine spins forever:
+// the TCP connection to it can never be completed.
+ucs_status_t do_uct_am_short_lock_try(pthread_mutex_t *lock, uct_ep_h ep, uint8_t id, uint64_t seq_id, tangram_uct_addr_t* my_addr, void* data, size_t length, int timeout_ms);
 void do_uct_am_short_progress(uct_worker_h worker, uct_ep_h ep, uint8_t id, uint64_t seq_id, tangram_uct_addr_t* my_addr, void* data, size_t length);
 
 void* tangram_uct_addr_serialize(tangram_uct_addr_t* addr, size_t* len);

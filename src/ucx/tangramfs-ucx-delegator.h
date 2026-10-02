@@ -1,6 +1,7 @@
 #ifndef _TANGRAMFS_UCX_DELEGATOR_H_
 #define _TANGRAMFS_UCX_DELEGATOR_H_
 
+#include <stdbool.h>
 #include "tangramfs-ucx-comm.h"
 
 // Delegator
@@ -10,7 +11,9 @@ void tangram_ucx_delegator_start();
 void tangram_ucx_delegator_stop();
 
 void tangram_ucx_delegator_sendrecv_server(uint8_t id, void* data, size_t length, void** respond_ptr);
-void tangram_ucx_delegator_sendrecv_delegator(uint8_t id, tangram_uct_addr_t* dest, void* data, size_t length, void** respond_ptr);
+// BUGFIX (Bug 2/3): returns false if the peer delegator could not be reached
+// or did not reply in time; *respond_ptr is not written in that case.
+bool tangram_ucx_delegator_sendrecv_delegator(uint8_t id, tangram_uct_addr_t* dest, void* data, size_t length, void** respond_ptr);
 
 tangram_uct_addr_t* tangram_ucx_delegator_intra_addr();
 tangram_uct_addr_t* tangram_ucx_delegator_inter_addr();
