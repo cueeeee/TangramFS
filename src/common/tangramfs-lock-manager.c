@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <pthread.h>
 #include "utlist.h"
 #include "uthash.h"
 #include "lock-token.h"
@@ -100,8 +103,18 @@ void split_lock(lock_token_list_t* token_list, lock_token_t* conflict_token, siz
 }
 
 
+// BUGFIX (data race): on a delegator the lock table is touched by two worker
+// threads at once -- worker 0 runs acquire/release requests from local
+// clients, worker 1 runs split requests from other delegators (they were put
+// on separate workers on purpose, so that two delegators asking each other
+// for locks cannot deadlock). Nothing protected the table between them. This
+// mutex guards every table/token-list access. It is NEVER held across an RPC,
+// otherwise the original deadlock this split of workers avoids would come back.
+static pthread_mutex_t g_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 lock_token_t* tangram_lockmgr_delegator_acquire_lock(lock_table_t** lt, tangram_uct_addr_t* client, char* filename, size_t offset, size_t count, int type) {
 
+    pthread_mutex_lock(&g_table_mutex);
     lock_table_t* entry = NULL;
     HASH_FIND_STR(*lt, filename, entry);
 
@@ -128,9 +141,11 @@ lock_token_t* tangram_lockmgr_delegator_acquire_lock(lock_table_t** lt, tangram_
         } else {
         // Case 2:
         // Had the write lock alraedy, nothing to do.
+            pthread_mutex_unlock(&g_table_mutex);
             return token;
         }
     }
+    pthread_mutex_unlock(&g_table_mutex);
 
     // Do not have the lock, ask server for it
     void* out;
@@ -142,9 +157,20 @@ lock_token_t* tangram_lockmgr_delegator_acquire_lock(lock_table_t** lt, tangram_
 
     while(res->result == LOCK_ACQUIRE_CONFLICT) {
         // 1. Ask the conflict token onwer to split and release the conflicting range
-        void* ack;
-        tangram_ucx_delegator_sendrecv_delegator(AM_ID_SPLIT_LOCK_REQUEST, res->owner, in, in_size, &ack);
-        free(ack);
+        //
+        // BUGFIX (Bug 2/3): the owner may be unreachable or may not answer in
+        // time (e.g. it is shutting down). sendrecv_delegator() now reports
+        // that instead of hanging or asserting, and leaves `ack` untouched --
+        // so `ack` must start as NULL and is only freed when a reply arrived.
+        // Either way we go on to step 2 and re-ask the server, which is the
+        // authority on who owns the range now. The short pause only matters
+        // when the owner is unreachable, so we don't hammer the server.
+        void* ack = NULL;
+        bool got_reply = tangram_ucx_delegator_sendrecv_delegator(AM_ID_SPLIT_LOCK_REQUEST, res->owner, in, in_size, &ack);
+        if(got_reply)
+            free(ack);
+        else
+            usleep(10000);
 
         // 2. Once the conflict owner release its token, we can acquire it
         // from the server again
@@ -167,7 +193,9 @@ lock_token_t* tangram_lockmgr_delegator_acquire_lock(lock_table_t** lt, tangram_
 
     // Exit while loop indicates the token was successfully granted
     tangram_assert(res->result == LOCK_ACQUIRE_SUCCESS);
+    pthread_mutex_lock(&g_table_mutex);
     lock_token_add_direct(&entry->token_list, res->token);
+    pthread_mutex_unlock(&g_table_mutex);
 
     // only free res, res->owner should be NULL, res->token will be returned;
     token = res->token;
@@ -180,19 +208,24 @@ lock_token_t* tangram_lockmgr_delegator_acquire_lock(lock_table_t** lt, tangram_
 
 // Someone tries to request a lock that conflicts with ours
 // so we are asked to split our lock.
-void tangram_lockmgr_delegator_split_lock(lock_table_t* lt, char* filename, size_t offset, size_t count, int type) {
+void tangram_lockmgr_delegator_split_lock(lock_table_t** lt, char* filename, size_t offset, size_t count, int type) {
+    pthread_mutex_lock(&g_table_mutex);
     lock_table_t* entry = NULL;
-    HASH_FIND_STR(lt, filename, entry);
-    if(!entry) return;
+    HASH_FIND_STR(*lt, filename, entry);
 
-    lock_token_t* token;
-    token = lock_token_find_conflict(&entry->token_list, offset, count);
-
-    if(token != NULL) {
-        split_lock(&entry->token_list, token, offset, count, false);
-    } else {
-        printf("CHEN Ask me to split lock, but no conflict found!\n");
+    // BUGFIX: originally `if(!entry) return;` here, which skipped the release
+    // to the server below. If the server still records us as the owner (e.g.
+    // our local copy is already gone), the requester would then be sent back
+    // to us forever. Always tell the server we give up the range.
+    if(entry) {
+        lock_token_t* token;
+        token = lock_token_find_conflict(&entry->token_list, offset, count);
+        if(token != NULL)
+            split_lock(&entry->token_list, token, offset, count, false);
+        else
+            printf("CHEN Ask me to split lock, but no conflict found!\n");
     }
+    pthread_mutex_unlock(&g_table_mutex);
 
     // Once I split my token and released locally partial of it,
     // notify the server (use release lock request) and ask it to do the same
@@ -203,7 +236,7 @@ void tangram_lockmgr_delegator_split_lock(lock_table_t* lt, char* filename, size
     free(ack);
 }
 
-lock_acquire_result_t* tangram_lockmgr_server_acquire_lock(lock_table_t** lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count, int type, int lock_algo) {
+static lock_acquire_result_t* server_acquire_lock_nolock(lock_table_t** lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count, int type, int lock_algo) {
     lock_acquire_result_t *result = malloc(sizeof(lock_acquire_result_t));
     result->result = LOCK_ACQUIRE_SUCCESS;
 
@@ -266,7 +299,7 @@ lock_acquire_result_t* tangram_lockmgr_server_acquire_lock(lock_table_t** lt, ta
     return result;
 }
 
-void tangram_lockmgr_server_release_lock(lock_table_t* lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count) {
+static void server_release_lock_nolock(lock_table_t* lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count) {
     lock_table_t* entry = NULL;
     HASH_FIND_STR(lt, filename, entry);
 
@@ -279,7 +312,7 @@ void tangram_lockmgr_server_release_lock(lock_table_t* lt, tangram_uct_addr_t* d
         split_lock(&entry->token_list, token, offset, count, true);
 }
 
-void tangram_lockmgr_server_release_lock_file(lock_table_t* lt, tangram_uct_addr_t* client, char* filename) {
+static void server_release_lock_file_nolock(lock_table_t* lt, tangram_uct_addr_t* client, char* filename) {
     lock_table_t* entry = NULL;
     HASH_FIND_STR(lt, filename, entry);
 
@@ -288,13 +321,39 @@ void tangram_lockmgr_server_release_lock_file(lock_table_t* lt, tangram_uct_addr
     }
 }
 
-void tangram_lockmgr_server_release_lock_client(lock_table_t* lt, tangram_uct_addr_t* client) {
+static void server_release_lock_client_nolock(lock_table_t* lt, tangram_uct_addr_t* client) {
     lock_table_t *entry, *tmp;
     HASH_ITER(hh, lt, entry, tmp) {
         lock_token_delete_client(&entry->token_list, client);
     }
 }
 
+
+// Locked entry points (see g_table_mutex above).
+lock_acquire_result_t* tangram_lockmgr_server_acquire_lock(lock_table_t** lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count, int type, int lock_algo) {
+    pthread_mutex_lock(&g_table_mutex);
+    lock_acquire_result_t* res = server_acquire_lock_nolock(lt, delegator, filename, offset, count, type, lock_algo);
+    pthread_mutex_unlock(&g_table_mutex);
+    return res;
+}
+
+void tangram_lockmgr_server_release_lock(lock_table_t* lt, tangram_uct_addr_t* delegator, char* filename, size_t offset, size_t count) {
+    pthread_mutex_lock(&g_table_mutex);
+    server_release_lock_nolock(lt, delegator, filename, offset, count);
+    pthread_mutex_unlock(&g_table_mutex);
+}
+
+void tangram_lockmgr_server_release_lock_file(lock_table_t* lt, tangram_uct_addr_t* client, char* filename) {
+    pthread_mutex_lock(&g_table_mutex);
+    server_release_lock_file_nolock(lt, client, filename);
+    pthread_mutex_unlock(&g_table_mutex);
+}
+
+void tangram_lockmgr_server_release_lock_client(lock_table_t* lt, tangram_uct_addr_t* client) {
+    pthread_mutex_lock(&g_table_mutex);
+    server_release_lock_client_nolock(lt, client);
+    pthread_mutex_unlock(&g_table_mutex);
+}
 
 void tangram_lockmgr_init(lock_table_t** lt) {
     *lt = NULL;

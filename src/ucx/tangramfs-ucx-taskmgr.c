@@ -77,7 +77,9 @@ void* worker_func(void* arg) {
 
         // If no task available, go to sleep
         // Delegator will insert a task and wake us up later.
-        if (me->tasks == NULL) {
+        // BUGFIX: `while`, not `if` -- pthread_cond_wait() may wake up
+        // spuriously, and the assert below would then fire on an empty queue.
+        while (me->tasks == NULL && me->running) {
             pthread_cond_wait(&me->cond, &me->lock);
         }
 
@@ -103,6 +105,7 @@ void* worker_func(void* arg) {
     //
     // But it is possible that client stoped the delegator
     // before all their requests have been finished.
+    return NULL;
 }
 
 void taskmgr_init(taskmgr_t* mgr, int num_workers,

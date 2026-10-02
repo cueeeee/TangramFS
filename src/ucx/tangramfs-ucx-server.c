@@ -64,14 +64,30 @@ static ucs_status_t am_stop_listener(void *arg, void *buf, size_t buf_len, unsig
     return UCS_OK;
 }
 
-void server_handle_task(task_t* task) {
-    pthread_mutex_lock(&g_server_context.mutex);
-    uct_ep_h ep;
-    uct_ep_create_connect(g_server_context.iface, &task->client, &ep);
-    pthread_mutex_unlock(&g_server_context.mutex);
+// BUGFIX (server freeze): all lock requests are handled by ONE server worker
+// (to serialize them). Originally, replying to a requester whose process had
+// stopped driving its UCX progress engine spun forever on UCS_ERR_NO_RESOURCE,
+// and a requester that had exited made the server assert and die. Either way a
+// single misbehaving node took down lock service for every node. The reply is
+// now bounded and failures are logged and skipped.
+#define SERVER_REPLY_TIMEOUT_MS 5000
 
+void server_handle_task(task_t* task) {
     task->respond = (*server_am_handler)(task->id, &task->client, task->data, &task->id, &task->respond_len);
-    do_uct_am_short_lock(&g_server_context.mutex, ep, task->id, task->seq_id, &g_server_context.self_addr, task->respond, task->respond_len);
+
+    uct_ep_h ep;
+    pthread_mutex_lock(&g_server_context.mutex);
+    ucs_status_t status = uct_ep_create_connect_try(g_server_context.iface, &task->client, &ep);
+    pthread_mutex_unlock(&g_server_context.mutex);
+    if(status != UCS_OK) {
+        printf("[tangramfs server] cannot reach requester (%s), reply dropped\n", ucs_status_string(status));
+        return;
+    }
+
+    status = do_uct_am_short_lock_try(&g_server_context.mutex, ep, task->id, task->seq_id, &g_server_context.self_addr,
+                                      task->respond, task->respond_len, SERVER_REPLY_TIMEOUT_MS);
+    if(status != UCS_OK)
+        printf("[tangramfs server] reply to requester failed (%s), dropped\n", ucs_status_string(status));
 
     pthread_mutex_lock(&g_server_context.mutex);
     uct_ep_destroy(ep);

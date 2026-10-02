@@ -59,7 +59,7 @@ void* delegator_rpc_handler(uint8_t id, tangram_uct_addr_t* client, void* data, 
         rpc_in_t* in = rpc_in_unpack(data);
         tangram_assert(in->num_intervals == 1);
         tangram_debug("[tangramfs delegator %s] split lock start, filename: %s, offset:%lu, count: %lu\n", hostname, in->filename, in->intervals[0].offset, in->intervals[0].count);
-        tangram_lockmgr_delegator_split_lock(g_lt, in->filename, in->intervals[0].offset, in->intervals[0].count, in->intervals[0].type);
+        tangram_lockmgr_delegator_split_lock(&g_lt, in->filename, in->intervals[0].offset, in->intervals[0].count, in->intervals[0].type);
         tangram_debug("[tangramfs delegator %s] split lock done, filename: %s, offset:%lu, count: %lu\n", hostname, in->filename, in->intervals[0].offset, in->intervals[0].count);
         rpc_in_free(in);
         respond = malloc(sizeof(int));
@@ -78,6 +78,26 @@ void tangram_delegator_start(tfs_info_t* tfs_info) {
     // Enter the progress loop and exit when the
     // stop command is received
     tangram_ucx_delegator_start();
+}
+
+// BUGFIX (Bug 4 -- root cause of the 2-node failures): a delegator keeps
+// (caches) the lock tokens the server granted it even after its local clients
+// release them; it only gives a range up when another delegator asks it to
+// split. Nothing ever handed those tokens back when the delegator exited, so
+// the server kept naming a delegator that no longer existed as the owner, and
+// every node that later needed one of those ranges was sent to negotiate with
+// it. Depending on timing that ended in an assertion abort ("Connection
+// refused"), in the exiting node hanging on shutdown, or in the server's lock
+// worker spinning on a reply that could never be delivered, which froze lock
+// service for every node.
+//
+// Called while the delegator is still fully running (before STOP): asks the
+// server to drop every lock owned by this delegator. After this, the server
+// never sends anyone to us again.
+void tangram_delegator_flush_to_server() {
+    void* ack = NULL;
+    tangram_ucx_delegator_sendrecv_server(AM_ID_RELEASE_LOCK_CLIENT_REQUEST, NULL, 0, &ack);
+    free(ack);
 }
 
 void tangram_delegator_stop() {
